@@ -61,7 +61,9 @@ WORKDIR /DeepSpeech
 RUN ./bin/run-ldc93s1.sh
 
 # Install AIPowerMeter to track power consumption
-RUN pip3 install -i https://test.pypi.org/simple/ aipowermeter
+RUN git clone -b docker_implementation https://github.com/GreenAI-Uppa/AIPowerMeter AIPM
+
+RUN pip install --no-cache-dir -r AIPM/requirements.txt
 
 # Change DeepSpeech.py by adding experiment tracking
 WORKDIR /
