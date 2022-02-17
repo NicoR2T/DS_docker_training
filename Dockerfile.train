@@ -71,3 +71,5 @@ RUN git clone https://github.com/NicoR2T/DS_docker_training PowerDS && \
     cp PowerDS/DeepSpeech.py /DeepSpeech/DeepSpeech.py
 
 WORKDIR /DeepSpeech
+
+CMD ["python3", "DeepSpeech.py","--alphabet_config_path","/training_files/alphabet.txt","--scorer_path","/training_files/kenlm.scorer","--train_files","/datasrc/cv-8/clips/train.csv","--dev_files","/datasrc/cv-8/clips/valid.csv","--test_files","/datasrc/cv-8/clips/test.csv","--checkpoint_dir","/mnt/checkpoints","--export_dir","/mnt/exported-model","--epochs","16","--reduce_lr_on_plateau","true","--plateau_epochs","8","--plateau_reduction","0.08","--early_stop","true","--es_epochs","5","--es_min_delta","0.06","--dropout_rate","0.3"]
