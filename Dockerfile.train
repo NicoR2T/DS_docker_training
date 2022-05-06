@@ -1,64 +1,89 @@
-# Please refer to the TRAINING documentation, "Basic Dockerfile for training"
+# This is a Dockerfile useful for training models with Coqui STT.
+# You can train "acoustic models" with audio + Tensorflow, and
+# you can create "scorers" with text + KenLM.
 
-FROM tensorflow/tensorflow:1.15.4-gpu-py3
-ENV DEBIAN_FRONTEND=noninteractive \
-    DEEPSPEECH_REPO=https://github.com/mozilla/DeepSpeech.git \
-    DEEPSPEECH_SHA=master
+FROM nvcr.io/nvidia/tensorflow:22.02-tf1-py3 AS kenlm-build
+ENV DEBIAN_FRONTEND=noninteractive
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    apt-utils \
-    bash-completion \
-    build-essential \
-    cmake \
-    curl \
-    git \
-    libboost-all-dev \
-    libbz2-dev \
-    liblzma-dev \
-    locales \
-    python3-venv \
-    unzip \
-    xz-utils \
-    wget && \
-    # We need to remove it because it's breaking deepspeech install later with \
-    # weird errors about setuptools \
-    apt-get purge -y python3-xdg && \
-    # Install dependencies for audio augmentation \
-    apt-get install -y --no-install-recommends libopus0 libsndfile1 && \
-    # Try and free some space \
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+    build-essential cmake libboost-system-dev \
+    libboost-thread-dev libboost-program-options-dev \
+    libboost-test-dev libeigen3-dev zlib1g-dev \
+    libbz2-dev liblzma-dev && \
     rm -rf /var/lib/apt/lists/*
 
-WORKDIR /
-RUN git clone $DEEPSPEECH_REPO DeepSpeech && \
-    cd /DeepSpeech && git fetch origin $DEEPSPEECH_SHA && git checkout $DEEPSPEECH_SHA && \
-    git submodule sync kenlm/ && git submodule update --init kenlm/
-
-# Build CTC decoder first, to avoid clashes on incompatible versions upgrades
-RUN cd /DeepSpeech/native_client/ctcdecode && make NUM_PROCESSES=$(nproc) bindings && \
-    pip3 install --upgrade dist/*.whl
-
-# Prepare deps
-RUN cd /DeepSpeech && pip3 install --upgrade pip==20.2.2 wheel==0.34.2 setuptools==49.6.0 && \
-    # Install DeepSpeech \
-    #  - No need for the decoder since we did it earlier \
-    #  - There is already correct TensorFlow GPU installed on the base image, \
-    #    we don't want to break that \
-    DS_NODECODER=y DS_NOTENSORFLOW=y pip3 install --upgrade -e . && \
-    # Tool to convert output graph for inference \
-    curl -vsSL https://github.com/mozilla/DeepSpeech/releases/download/v0.9.3/linux.amd64.convert_graphdef_memmapped_format.xz | xz -d > convert_graphdef_memmapped_format && \
-    chmod +x convert_graphdef_memmapped_format
-
 # Build KenLM to generate new scorers
-WORKDIR /DeepSpeech/kenlm
-RUN wget -O - https://gitlab.com/libeigen/eigen/-/archive/3.3.8/eigen-3.3.8.tar.bz2 | tar xj && \
+WORKDIR /code
+COPY kenlm /code/kenlm
+RUN cd /code/kenlm && \
     mkdir -p build && \
     cd build && \
-    EIGEN3_ROOT=/DeepSpeech/kenlm/eigen-3.3.8 cmake .. && \
-    make -j $(nproc)
+    cmake .. && \
+    make -j $(nproc) || \
+    ( echo "ERROR: Failed to build KenLM."; \
+    echo "ERROR: Make sure you update the kenlm submodule on host before building this Dockerfile."; \
+    echo "ERROR: $ cd STT; git submodule update --init kenlm"; \
+    exit 1; )
 
-WORKDIR /DeepSpeech
 
-RUN ./bin/run-ldc93s1.sh
+FROM nvcr.io/nvidia/tensorflow:22.02-tf1-py3
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        git \
+        wget \
+        libopus0 \
+        libopusfile0 \
+        libsndfile1 \
+        sox \
+        libsox-fmt-mp3 \
+        python3-venv && \
+    rm -rf /var/lib/apt/lists/*
+
+RUN python3 -m venv --system-site-packages /venv
+ENV VIRTUAL_ENV=/venv
+ENV PATH="$VIRTUAL_ENV/bin:$PATH"
+
+# Make sure pip and its dependencies are up-to-date
+RUN pip install --upgrade pip wheel setuptools
+
+WORKDIR /code
+
+COPY native_client /code/native_client
+COPY .git /code/.git
+COPY training/coqui_stt_training/VERSION /code/training/coqui_stt_training/VERSION
+COPY training/coqui_stt_training/GRAPH_VERSION /code/training/coqui_stt_training/GRAPH_VERSION
+
+# Build CTC decoder first, to avoid clashes on incompatible versions upgrades
+RUN cd native_client/ctcdecode && make NUM_PROCESSES=$(nproc) bindings
+RUN pip install --upgrade native_client/ctcdecode/dist/*.whl
+
+COPY setup.py /code/setup.py
+COPY VERSION /code/VERSION
+COPY training /code/training
+# Copy files from previous build stages
+RUN mkdir -p /code/kenlm/build/
+COPY --from=kenlm-build /code/kenlm/build/bin /code/kenlm/build/bin
+
+# Tool to convert output graph for inference
+RUN curl -L https://github.com/coqui-ai/STT/releases/download/v0.9.3/convert_graphdef_memmapped_format.linux.amd64.zip | funzip > convert_graphdef_memmapped_format && \
+    chmod +x convert_graphdef_memmapped_format
+
+# Pre-built native client tools
+RUN LATEST_STABLE_RELEASE=$(curl "https://api.github.com/repos/coqui-ai/STT/releases/latest" | python -c 'import sys; import json; print(json.load(sys.stdin)["tag_name"])') \
+ bash -c 'curl -L https://github.com/coqui-ai/STT/releases/download/${LATEST_STABLE_RELEASE}/native_client.tflite.Linux.tar.xz | tar -xJvf -'
+
+# Install STT
+# No need for the decoder since we did it earlier
+# TensorFlow GPU should already be installed on the base image,
+# and we don't want to break that
+RUN DS_NODECODER=y DS_NOTENSORFLOW=y pip install --upgrade -e .
+
+# Copy rest of the code and test training
+COPY . /code
+RUN ./bin/run-ldc93s1.sh && rm -rf ~/.local/share/stt
 
 # Install AIPowerMeter to track power consumption
 RUN git clone -b docker_implementation https://github.com/GreenAI-Uppa/AIPowerMeter AIPM
@@ -67,9 +92,7 @@ RUN pip install --no-cache-dir -r AIPM/requirements.txt
 
 # Change DeepSpeech.py by adding experiment tracking
 WORKDIR /
-RUN git clone https://github.com/NicoR2T/DS_docker_training PowerDS && \
-    cp PowerDS/DeepSpeech.py /DeepSpeech/DeepSpeech.py
+RUN git clone https://github.com/NicoR2T/DS_docker_training trackCoqui && \
+    cp trackCoqui/DeepSpeech.py /DeepSpeech/DeepSpeech.py
 
-WORKDIR /DeepSpeech
-
-#CMD ["python3", "DeepSpeech.py","--alphabet_config_path","/training_files/alphabet.txt","--scorer_path","/training_files/kenlm.scorer","--train_files","/datasrc/cv-8/clips/train.csv","--dev_files","/datasrc/cv-8/clips/valid.csv","--test_files","/datasrc/cv-8/clips/test.csv","--checkpoint_dir","/mnt/checkpoints","--export_dir","/mnt/exported-model","--epochs","16","--reduce_lr_on_plateau","true","--plateau_epochs","8","--plateau_reduction","0.08","--early_stop","true","--es_epochs","5","--es_min_delta","0.06","--dropout_rate","0.3"]
+WORKDIR /code
